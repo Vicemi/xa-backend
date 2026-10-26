@@ -1,0 +1,9 @@
+# docker compose up -d --build   (lee ./.env). Poné cloudflared delante, ver README.
+services:
+  xa-backend:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    # Detrás de un Cloudflare Tunnel en la misma máquina, publicá el puerto solo en localhost:
+    ports:
+      - "127.0.0.1:8787:8787"
