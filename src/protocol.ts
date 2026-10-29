@@ -24,6 +24,10 @@ export const ClientMessage = t.Union([
   t.Object({ t: t.Literal('settings'), powerups: t.Boolean() }),
   t.Object({ t: t.Literal('kick'), id: t.Integer({ minimum: 0, maximum: 7 }) }),
   t.Object({ t: t.Literal('start') }),
+  // "Todo listo" del anfitrión: pasa la sala a la etapa de menús (on) o la devuelve al lobby (off).
+  t.Object({ t: t.Literal('go'), on: t.Boolean() }),
+  // Estado de los menús del anfitrión (pantalla, cursor, mapa, progreso): se reenvía tal cual a los demás.
+  t.Object({ t: t.Literal('menu'), d: Blob }),
   // Señalización WebRTC entre el anfitrión y un invitado (oferta / respuesta / candidato ICE); el servidor solo la reenvía.
   t.Object({ t: t.Literal('rtc'), to: t.Integer({ minimum: 0, maximum: 7 }), d: t.Object({ k: t.Union([t.Literal('offer'), t.Literal('answer'), t.Literal('ice')]), s: t.Optional(t.String({ maxLength: 12000 })), c: t.Optional(t.Any()) }) }),
   // Controles del invitado: bits de abajo (left 1, right 2, up 4, down 8, fire 16, jump 32) + secuencia.

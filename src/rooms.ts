@@ -9,9 +9,11 @@
 import { createHash, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import type { WebSocket } from 'ws';
 import { config } from './config.js';
-import { COLORS, cleanSettings, defaultSettings, difficultyOf, type Difficulty, type Settings } from './game.js';
+import { COLORS, HOST_COLOR, cleanSettings, defaultSettings, difficultyOf, type Difficulty, type Settings } from './game.js';
 
 export type Status = 'lobby' | 'playing';
+/** lobby = armando la sala; browse = el anfitrión ya dijo "todo listo" y recorre los menús (los demás lo miran y votan). */
+export type Stage = 'lobby' | 'browse';
 export interface Player {
   id: number;
   name: string;
@@ -27,6 +29,9 @@ export interface Player {
 export interface Room {
   code: string;
   status: Status;
+  stage: Stage;
+  /** último estado de menús que mandó el anfitrión (para quien entra o vuelve a media etapa) */
+  menu: unknown;
   settings: Settings;
   hostKeyHash: Buffer;
   hostId: number | null;
@@ -44,6 +49,7 @@ export interface Room {
 export interface RoomView {
   code: string;
   status: Status;
+  stage: Stage;
   hostId: number | null;
   max: number;
   settings: Settings;
@@ -91,7 +97,7 @@ export class Rooms {
     const hostKey = randomBytes(24).toString('hex');
     const now = Date.now();
     const room: Room = {
-      code: this.newCode(), status: 'lobby', settings: defaultSettings(), hostKeyHash: sha(hostKey), hostId: null,
+      code: this.newCode(), status: 'lobby', stage: 'lobby', menu: null, settings: defaultSettings(), hostKeyHash: sha(hostKey), hostId: null,
       players: new Map(), creatorIp: ip, banned: new Set(), level: 0, votes: new Map(), createdAt: now, lastActive: now,
     };
     this.rooms.set(room.code, room);
@@ -101,7 +107,7 @@ export class Rooms {
   view(room: Room): RoomView {
     const players = [...room.players.values()].sort((a, b) => a.id - b.id);
     return {
-      code: room.code, status: room.status, hostId: room.hostId, max: maxPlayers(), settings: room.settings,
+      code: room.code, status: room.status, stage: room.stage, hostId: room.hostId, max: maxPlayers(), settings: room.settings,
       level: room.level,
       votes: players.filter((p) => room.votes.has(p.id)).map((p) => ({ id: p.id, level: room.votes.get(p.id)! })),
       players: players.map((p) => ({ id: p.id, name: p.name, color: p.color, ready: p.ready, host: p.id === room.hostId, online: p.lostAt === null })),
@@ -109,12 +115,11 @@ export class Rooms {
     };
   }
 
-  /** Un color libre al azar (los colores de la paleta nunca coinciden con los de los power-ups). */
-  private randomColor(room: Room, except: number): number {
+  /** El primer color libre para un invitado (el 0 es del anfitrión; nunca coincide con los de los power-ups). */
+  private guestColor(room: Room, except: number): number {
     const used = new Set([...room.players.values()].filter((o) => o.id !== except).map((o) => o.color));
-    const free = COLORS.map((_, i) => i).filter((i) => !used.has(i));
-    if (free.length === 0) return -1;
-    return free[randomInt(free.length)]!;
+    const free = COLORS.map((_, i) => i).filter((i) => i !== HOST_COLOR && !used.has(i));
+    return free[0] ?? 1;
   }
 
   private connected(p: Player): boolean { return p.lostAt === null && !!p.ws; }
@@ -152,9 +157,10 @@ export class Rooms {
     while (room.players.has(id)) id++;
     const player: Player = { id, name, color: 0, ready: false, ws, sidHash: Buffer.alloc(32), ipHash, lostAt: null };
     const sid = this.issue(player);
-    player.color = Math.max(0, this.randomColor(room, id));
+    player.color = isHost ? HOST_COLOR : this.guestColor(room, id);
     room.players.set(id, player);
     if (isHost) { room.hostId = id; player.ready = true; }
+    else if (room.stage === 'browse') player.ready = true;   // entra con la etapa de menús ya abierta: no frena al anfitrión
     room.lastActive = Date.now();
     return { room, player, sid, claimed: false, replaced: null };
   }
@@ -210,14 +216,42 @@ export class Rooms {
     if (room.status !== 'lobby') return 'started';
     if (color < 0 || color >= COLORS.length) return 'invalid';
     if ([...room.players.values()].some((o) => o.id !== p.id && o.color === color)) return 'taken';
+    if (p.id === room.hostId || color === HOST_COLOR) return p.color === color ? null : 'invalid';   // el 0 (original) es fijo del anfitrión
     p.color = color;
     room.lastActive = Date.now();
     return null;
   }
 
   setReady(room: Room, p: Player, ready: boolean): void {
-    if (room.status === 'lobby') p.ready = ready;
+    if (room.status === 'lobby' && p.id !== room.hostId) p.ready = ready;
     room.lastActive = Date.now();
+    // si alguien cancela su "listo" con los menús abiertos, la sala vuelve al lobby
+    if (!ready && room.stage === 'browse' && room.status === 'lobby' && p.id !== room.hostId) { room.stage = 'lobby'; room.menu = null; }
+  }
+
+  /** "Todo listo" del anfitrión (on) o volver al lobby (off). Devuelve un texto con el motivo si no se puede. */
+  go(room: Room, p: Player, on: boolean): RoomError | string | null {
+    if (p.id !== room.hostId) return 'forbidden';
+    if (room.status !== 'lobby') return 'started';
+    if (on) {
+      const ps = [...room.players.values()];
+      if (ps.some((o) => o.lostAt !== null)) return 'Falta un jugador que perdió la conexión';
+      const wait = ps.filter((o) => !o.ready).map((o) => o.name);
+      if (wait.length) return 'Todavía no están listos: ' + wait.join(', ');
+    }
+    room.stage = on ? 'browse' : 'lobby';
+    room.menu = null;
+    room.lastActive = Date.now();
+    return null;
+  }
+
+  /** El anfitrión publica el estado de sus menús. */
+  setMenu(room: Room, p: Player, d: unknown): boolean {
+    if (p.id !== room.hostId || room.status !== 'lobby') return false;
+    if (JSON.stringify(d).length > 2000) return false;
+    room.menu = d;
+    room.lastActive = Date.now();
+    return true;
   }
 
   /** Voto consultivo de nivel: el anfitrión decide si lo usa. */
@@ -248,10 +282,10 @@ export class Rooms {
   /** Por qué la sala todavía no puede empezar (null = puede). */
   startProblem(room: Room): string | null {
     const ps = [...room.players.values()];
-    if (ps.length === 0) return 'The room is empty';
-    if (ps.some((p) => p.lostAt !== null)) return 'Waiting for a player who lost the connection';
-    if (ps.some((p) => !p.ready)) return 'Waiting for everybody to be ready';
-    if (room.level === 0) return 'The host needs to choose a level';
+    if (ps.length === 0) return 'La sala está vacía';
+    if (ps.some((p) => p.lostAt !== null)) return 'Falta un jugador que perdió la conexión';
+    if (ps.some((p) => !p.ready)) return 'Todavía no están todos listos';
+    if (room.level === 0) return 'El anfitrión todavía no eligió un nivel';
     return null;
   }
 
@@ -268,6 +302,8 @@ export class Rooms {
   /** La partida terminó (lo dice el anfitrión, o se perdió al anfitrión): todos vuelven al lobby. */
   end(room: Room): void {
     room.status = 'lobby';
+    room.stage = 'lobby';
+    room.menu = null;
     room.votes.clear();
     for (const o of room.players.values()) o.ready = o.id === room.hostId;
     room.lastActive = Date.now();

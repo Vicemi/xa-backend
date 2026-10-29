@@ -5,16 +5,21 @@
 // con un efecto del juego.
 import { config } from './config.js';
 
-/** Colores de jugador (aleatorios y distintos entre sí; ninguno coincide con un power-up). */
+/**
+ * Colores de jugador. El 0 es "Original" (los colores del sprite de Xa, sin tinte) y es SIEMPRE del anfitrión; los
+ * invitados reciben el primer color libre de 1 en adelante (los primeros son los más distintos entre sí). El hex del
+ * 0 solo sirve para plaquitas y marcadores (el héroe del anfitrión no se tiñe). Ninguno coincide con un power-up.
+ */
+export const HOST_COLOR = 0;
 export const COLORS = [
+  { name: 'Original', hex: '#ffd23a' },
   { name: 'Violeta', hex: '#a855f7' },
   { name: 'Naranja', hex: '#ff8a2b' },
-  { name: 'Rosa', hex: '#ff5ec4' },
   { name: 'Azul', hex: '#4f7dff' },
+  { name: 'Turquesa', hex: '#20c9a0' },
+  { name: 'Rosa', hex: '#ff5ec4' },
   { name: 'Blanco', hex: '#f4f0e6' },
   { name: 'Marrón', hex: '#c08a4a' },
-  { name: 'Magenta', hex: '#e040a0' },
-  { name: 'Turquesa', hex: '#20c9a0' },
 ] as const;
 
 export interface Settings { powerups: boolean }

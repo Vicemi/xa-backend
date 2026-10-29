@@ -137,6 +137,7 @@ export function attachWebSocket(server: HttpServer, rooms: Rooms): { close(): vo
         attach(c, r.room, r.player);
         send(c.ws, { t: 'joined', you: r.player.id, host: r.player.id === r.room.hostId, sid: r.sid, resumed: false, claimed: r.claimed, room: rooms.view(r.room) });
         if (r.claimed && r.room.status === 'playing') send(hostOf(r.room)?.ws, { t: 'peer', id: r.player.id, online: true });
+        if (r.room.menu && r.player.id !== r.room.hostId) send(c.ws, { t: 'menu', d: r.room.menu });
         broadcastRoom(r.room);
         log.info(`room ${r.room.code}: ${r.player.name} ${r.claimed ? 'took the seat back' : 'joined'} (${r.room.players.size})`);
       } else {
@@ -146,6 +147,7 @@ export function attachWebSocket(server: HttpServer, rooms: Rooms): { close(): vo
         attach(c, r.room, r.player);
         send(c.ws, { t: 'joined', you: r.player.id, host: r.player.id === r.room.hostId, sid: String(m.sid), resumed: true, claimed: false, room: rooms.view(r.room) });
         if (r.room.status === 'playing' && r.player.id !== r.room.hostId) send(hostOf(r.room)?.ws, { t: 'peer', id: r.player.id, online: true });
+        if (r.room.menu && r.player.id !== r.room.hostId) send(c.ws, { t: 'menu', d: r.room.menu });
         broadcastRoom(r.room);
         log.info(`room ${r.room.code}: ${r.player.name} resumed`);
       }
@@ -159,6 +161,19 @@ export function attachWebSocket(server: HttpServer, rooms: Rooms): { close(): vo
     switch (m.t) {
       case 'color': { const e = rooms.setColor(room, player, Number(m.color)); if (e) roomErr(c, e); else broadcastRoom(room); break; }
       case 'ready': rooms.setReady(room, player, !!m.ready); broadcastRoom(room); break;
+      case 'go': {
+        const e = rooms.go(room, player, !!m.on);
+        if (e) { if (e in ERROR_TEXT) roomErr(c, e as RoomError); else err(c, 'not_ready', e); break; }
+        broadcastRoom(room);
+        log.info(`room ${room.code}: stage ${room.stage}`);
+        break;
+      }
+      case 'menu': {   // anfitrión -> los demás: dónde está en los menús
+        if (!rooms.setMenu(room, player, m.d)) break;
+        const out = JSON.stringify({ t: 'menu', d: m.d });
+        for (const p of room.players.values()) if (p.id !== player.id && p.ws?.readyState === WebSocket.OPEN) p.ws.send(out);
+        break;
+      }
       case 'vote': rooms.vote(room, player, Number(m.level)); broadcastRoom(room); break;
       case 'level': { const e = rooms.setLevel(room, player, Number(m.level)); if (e) roomErr(c, e); else broadcastRoom(room); break; }
       case 'settings': {

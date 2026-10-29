@@ -90,6 +90,7 @@ async function main() {
   const hj = await host.wait('joined');
   check(hj.host === true && hj.room.players[0].name === 'Hostscript' && /^[0-9a-f]{48}$/.test(hj.sid), 'el anfitrión entra con la clave; apodo limpio (máx. 10) y sesión');
   const hostColor = hj.room.players[0].color as number;
+  check(hostColor === 0 && hj.room.stage === 'lobby', 'el anfitrión tiene el color 0 (original, sin tinte)');
 
   const g1 = new Client(); await g1.ready();
   g1.send({ t: 'join', code: created.code, name: 'Ana' });

@@ -105,10 +105,12 @@ Si las variables no están definidas, el juego muestra que el modo online no est
 
 - **Salas**: un código de 5 caracteres (`A-Z` sin `O/I/L` y `2-9`, aleatorio con `crypto`). Se crea con `POST /api/rooms`, que también devuelve una **clave de anfitrión** secreta; solo quien la tiene puede ser el anfitrión.
 - **Coop de 1 a 4**: pueden jugar menos; incluso uno solo puede empezar. El anfitrión no puede empezar hasta que **todos estén listos**, estén conectados y haya **elegido un nivel**.
-- **Nombres y colores**: el apodo se recorta a **10 caracteres**. Cada jugador recibe un **color al azar y distinto** de una paleta que **nunca coincide con los colores de los power-ups** (cian, verde, rojo y amarillo).
-- **Niveles**: cualquier jugador puede **votar** un nivel; solo el **anfitrión** decide el nivel definitivo (`level`) y solo él empieza la partida (`start`).
+- **Nombres y colores**: el apodo se recorta a **10 caracteres**. El **anfitrión siempre tiene el color 0 ("Original")**: el juego no le pone tinte, conserva los colores del sprite de Xa. Los invitados reciben el primer color libre de 1 en adelante (violeta, naranja, azul, turquesa, …): distintos entre sí y **sin coincidir con los colores de los power-ups** (cian, verde, rojo y amarillo). El 0 no se puede elegir ni cambiar.
+- **Etapas de la sala** (`room.stage`): `lobby` (se arma la sala: nombres, «listo») y `browse` (el anfitrión dijo **«todo listo»** con `go`; recorre los menús del juego y los demás **miran** su estado de menús y **votan**). Quien entra con la etapa `browse` abierta entra ya listo; si alguien cancela su «listo» en `browse`, la sala vuelve a `lobby`.
+- **Niveles**: cualquier jugador puede **votar** un nivel; solo el **anfitrión** decide el nivel definitivo (`level`) y solo él empieza la partida (`start`). Qué niveles se pueden elegir lo define el progreso **del anfitrión** (lo guarda su navegador; viaja en el estado de menús).
 - **Power-ups**: en los niveles originales el anfitrión puede activarlos o desactivarlos (`settings.powerups`), pero **contra los jefes siempre están activos** (lo aplica el juego, no el servidor).
 - **Sesiones**: al entrar, cada jugador recibe un identificador de sesión secreto (solo se guarda su hash). Si se corta la conexión o se recarga la página, el asiento se conserva `RECONNECT_GRACE_SECONDS` y se vuelve con `resume`; también se puede volver **entrando de nuevo con el código de sala y el mismo apodo** mientras el asiento esté libre (incluso en plena partida). Los asientos que nadie reclama se liberan y las salas sin nadie se cierran.
+- **Casos límite**: 4 jugadores como máximo *contando al anfitrión* (el quinto recibe `error full`; el cliente además lo comprueba antes con `GET /api/rooms/:code`). Un jugador que pierde la conexión conserva su asiento `RECONNECT_GRACE_SECONDS`; mientras tanto el anfitrión no puede dar «todo listo» ni empezar (`error not_ready`). Un expulsado (`kick`) recibe `kicked` y no puede volver. Si el anfitrión se va (`leave`) o su asiento vence, todos reciben `closed` (`host_left`) y la sala desaparece; en la etapa `browse` el anfitrión puede perder la conexión hasta `RECONNECT_GRACE_SECONDS` (los demás ven «perdió la conexión»).
 - Si el anfitrión recarga la página en plena partida, la partida (que vivía en esa página) se termina para todos y vuelven al lobby con sus asientos. Si se va para siempre, la sala se cierra.
 
 ---
@@ -135,12 +137,14 @@ WebSocket: `wss://tu-servidor/ws`, con los sub-protocolos `xa-v1` y `token.<GAME
 | `{t:"vote", level}` | jugador | Voto consultivo de nivel (0 = sacar el voto). |
 | `{t:"level", level}` / `{t:"settings", powerups}` | anfitrión | Nivel de la partida / power-ups de los niveles originales. |
 | `{t:"kick", id}` / `{t:"start"}` | anfitrión | Expulsar / empezar. |
+| `{t:"go", on}` | anfitrión | «Todo listo» (`on:true`: pasa a la etapa `browse`; se rechaza con `error not_ready` si falta alguien listo o conectado) / volver al lobby (`on:false`). |
+| `{t:"menu", d}` | anfitrión | Estado de sus menús (JSON ≤ 2000 caracteres; el juego manda `{s, i, p, l, d, f}`: pantalla, botón, mapa, nodo, niveles completados y perfectos). Se reenvía a los demás y se guarda para quien entre o vuelva. |
 | `{t:"rtc", to, d}` | todos | Señalización WebRTC (oferta / respuesta / ICE); el servidor solo la reenvía. |
 | `{t:"in", d:{b,q}}` | invitado | Controles (bits: left 1, right 2, up 4, down 8, fire 16, jump 32 + secuencia) → solo al anfitrión. |
 | `{t:"snap", d}` | anfitrión | Estado del mundo → a los invitados. |
 | `{t:"end", d?}` | anfitrión | Termina la partida: todos vuelven al lobby. |
 
-El servidor responde con `joined`, `room` (estado del lobby), `start` (con la dificultad, el nivel y los ajustes), `in`, `snap`, `ended`, `left`, `peer`, `rtc`, `kicked`, `replaced`, `closed`, `error` y `pong`. `joined` trae el identificador de sesión (`sid`). Los mensajes del lobby se validan con TypeBox; de `in`/`snap` solo se mira el tamaño: el servidor nunca interpreta ni ejecuta su contenido.
+El servidor responde con `joined`, `room` (estado del lobby, con `stage`), `menu` (el estado de menús del anfitrión), `start` (con la dificultad, el nivel y los ajustes), `in`, `snap`, `ended`, `left`, `peer`, `rtc`, `kicked`, `replaced`, `closed`, `error` y `pong`. `joined` trae el identificador de sesión (`sid`). Los mensajes del lobby se validan con TypeBox; de `in`/`snap` solo se mira el tamaño: el servidor nunca interpreta ni ejecuta su contenido.
 
 ## Latencia: conexión directa entre jugadores (WebRTC)
 
