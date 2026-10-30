@@ -72,6 +72,8 @@ export const config = {
   reconnectGraceSeconds: int('RECONNECT_GRACE_SECONDS', 45, 5, 600),
   /** Segundos que una partida espera a un anfitrión desconectado antes de terminarse para todos. */
   hostPlayGraceSeconds: int('HOST_PLAY_GRACE_SECONDS', 12, 3, 120),
+  /** Segundos que tiene un invitado que salió del nivel para volver (a jugar o a mirar) antes de que la partida termine. */
+  awayLimitSeconds: int('AWAY_LIMIT_SECONDS', 180, 2, 3600),
   /** Búsquedas / reanudaciones fallidas por dirección antes de bloquearla (evita adivinar códigos). */
   joinFailLimit: int('JOIN_FAIL_LIMIT', 12, 3, 1000),
   joinBlockMinutes: int('JOIN_BLOCK_MINUTES', 5, 1, 1440),

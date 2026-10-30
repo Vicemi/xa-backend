@@ -47,7 +47,7 @@ export function buildApi(rooms: Rooms, runtime: Runtime) {
           const room = rooms.get(params.code);
           if (!room) { joinGuard.fail(ip); set.status = 404; return { error: 'not_found' }; }
           const free = room.players.size < maxPlayers();
-          return { code: room.code, status: room.status, players: room.players.size, max: maxPlayers(), joinable: room.status === 'lobby' && free };
+          return { code: room.code, status: room.status, players: room.players.size, max: maxPlayers(), joinable: free };
         }, { params: CodeParams })
         // contadores para monitoreo (sin datos personales); solo con ADMIN_TOKEN y la cabecera x-admin-token
         .get('/admin/stats', ({ request, set }) => {

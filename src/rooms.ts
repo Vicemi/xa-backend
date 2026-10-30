@@ -14,6 +14,9 @@ import { COLORS, HOST_COLOR, cleanSettings, defaultSettings, difficultyOf, type 
 export type Status = 'lobby' | 'playing';
 /** lobby = armando la sala; browse = el anfitrión ya dijo "todo listo" y recorre los menús (los demás lo miran y votan). */
 export type Stage = 'lobby' | 'browse';
+/** Dónde está cada jugador mientras corre una partida: lobby = en la pantalla online (fuera del nivel), play = jugando,
+ *  watch = mirando como espectador. Fuera de partida todos están en `lobby`. La conexión (lostAt) va aparte. */
+export type At = 'lobby' | 'play' | 'watch';
 export interface Player {
   id: number;
   name: string;
@@ -25,6 +28,9 @@ export interface Player {
   ipHash: string;
   /** cuándo se perdió la conexión (null = conectado) */
   lostAt: number | null;
+  at: At;
+  /** cuándo salió del nivel en plena partida (null = no salió): si no vuelve en AWAY_LIMIT_SECONDS la partida termina */
+  awayAt: number | null;
 }
 export interface Room {
   code: string;
@@ -43,6 +49,8 @@ export interface Room {
   level: number;
   /** voto de nivel de cada jugador (id -> nivel) */
   votes: Map<number, number>;
+  /** dificultad fijada al empezar (la recibe también quien vuelve a la partida) */
+  difficulty: Difficulty | null;
   createdAt: number;
   lastActive: number;
 }
@@ -55,7 +63,8 @@ export interface RoomView {
   settings: Settings;
   level: number;
   votes: { id: number; level: number }[];
-  players: { id: number; name: string; color: number; ready: boolean; host: boolean; online: boolean }[];
+  /** at = dónde está; away = segundos que le quedan para volver al nivel (solo si salió en plena partida) */
+  players: { id: number; name: string; color: number; ready: boolean; host: boolean; online: boolean; at: At; away?: number }[];
   difficulty: Difficulty;
 }
 
@@ -70,8 +79,8 @@ export const maxPlayers = (): number => config.maxCoopPlayers;
 
 /** Lo que decidió el barrido: el llamador avisa a los sockets. */
 export type SweepEvent =
-  | { kind: 'removed'; room: Room; player: Player; closed: boolean; others: Player[] }
-  | { kind: 'match_aborted'; room: Room }
+  | { kind: 'removed'; room: Room; player: Player; closed: boolean; others: Player[]; reason?: 'host' | 'alone' }
+  | { kind: 'match_aborted'; room: Room; reason: 'host_lost' | 'away_timeout'; name?: string }
   | { kind: 'idle'; room: Room };
 
 export class Rooms {
@@ -98,7 +107,7 @@ export class Rooms {
     const now = Date.now();
     const room: Room = {
       code: this.newCode(), status: 'lobby', stage: 'lobby', menu: null, settings: defaultSettings(), hostKeyHash: sha(hostKey), hostId: null,
-      players: new Map(), creatorIp: ip, banned: new Set(), level: 0, votes: new Map(), createdAt: now, lastActive: now,
+      players: new Map(), creatorIp: ip, banned: new Set(), level: 0, votes: new Map(), difficulty: null, createdAt: now, lastActive: now,
     };
     this.rooms.set(room.code, room);
     return { room, hostKey };
@@ -106,11 +115,13 @@ export class Rooms {
 
   view(room: Room): RoomView {
     const players = [...room.players.values()].sort((a, b) => a.id - b.id);
+    const now = Date.now();
+    const away = (p: Player) => (p.awayAt === null ? {} : { away: Math.max(0, Math.ceil((p.awayAt + config.awayLimitSeconds * 1000 - now) / 1000)) });
     return {
       code: room.code, status: room.status, stage: room.stage, hostId: room.hostId, max: maxPlayers(), settings: room.settings,
       level: room.level,
       votes: players.filter((p) => room.votes.has(p.id)).map((p) => ({ id: p.id, level: room.votes.get(p.id)! })),
-      players: players.map((p) => ({ id: p.id, name: p.name, color: p.color, ready: p.ready, host: p.id === room.hostId, online: p.lostAt === null })),
+      players: players.map((p) => ({ id: p.id, name: p.name, color: p.color, ready: p.ready, host: p.id === room.hostId, online: p.lostAt === null, at: p.at, ...away(p) })),
       difficulty: difficultyOf(players.length),
     };
   }
@@ -151,16 +162,16 @@ export class Rooms {
       return { room, player: seat, sid: this.issue(seat), claimed: true, replaced };
     }
 
-    if (room.status !== 'lobby') return 'started';
+    // con la partida en curso también se puede entrar: queda en la pantalla online y elige jugar o mirar
     if (room.players.size >= maxPlayers()) return 'full';
     let id = 0;
     while (room.players.has(id)) id++;
-    const player: Player = { id, name, color: 0, ready: false, ws, sidHash: Buffer.alloc(32), ipHash, lostAt: null };
+    const player: Player = { id, name, color: 0, ready: false, ws, sidHash: Buffer.alloc(32), ipHash, lostAt: null, at: 'lobby', awayAt: null };
     const sid = this.issue(player);
     player.color = isHost ? HOST_COLOR : this.guestColor(room, id);
     room.players.set(id, player);
     if (isHost) { room.hostId = id; player.ready = true; }
-    else if (room.stage === 'browse') player.ready = true;   // entra con la etapa de menús ya abierta: no frena al anfitrión
+    else if (room.stage === 'browse' || room.status === 'playing') player.ready = true;   // entra con los menús abiertos o la partida en curso: no frena al anfitrión
     room.lastActive = Date.now();
     return { room, player, sid, claimed: false, replaced: null };
   }
@@ -190,18 +201,31 @@ export class Rooms {
     return true;
   }
 
-  /** Saca a un jugador para siempre. Si se va el anfitrión se cierra la sala (el navegador del anfitrión corre el juego). */
-  leave(room: Room, player: Player): { closed: boolean; others: Player[] } {
+  /** Saca a un jugador para siempre. Si se va el anfitrión se cierra la sala (el navegador del anfitrión corre el juego);
+   *  si se va el último invitado (no por expulsión) y queda solo el anfitrión, también: no hay con quién jugar. */
+  leave(room: Room, player: Player, closeIfAlone = true): { closed: boolean; others: Player[]; reason?: 'host' | 'alone' } {
     room.players.delete(player.id);
     room.votes.delete(player.id);
     player.ws = null;
     room.lastActive = Date.now();
-    if (player.id === room.hostId) {
-      const others = [...room.players.values()];
+    const others = [...room.players.values()];
+    if (player.id === room.hostId || (closeIfAlone && others.length === 1 && others[0]!.id === room.hostId)) {
       this.rooms.delete(room.code);
-      return { closed: true, others };
+      return { closed: true, others, reason: player.id === room.hostId ? 'host' : 'alone' };
     }
-    return { closed: false, others: [...room.players.values()] };
+    return { closed: false, others };
+  }
+
+  /** Invitado en plena partida: sale del nivel a la pantalla online (lobby), vuelve a jugar (play) o mira (watch). */
+  setAt(room: Room, p: Player, at: At): RoomError | null {
+    if (room.status !== 'playing') return 'invalid';
+    if (p.id === room.hostId) return 'forbidden';   // si el anfitrión sale del nivel, termina la partida (`end`)
+    if (p.at === at) return null;
+    // el reloj de los minutos para volver corre desde que dejó de jugar (mirar también cuenta como haber vuelto)
+    p.awayAt = at === 'lobby' ? (p.at === 'play' ? Date.now() : p.awayAt) : null;
+    p.at = at;
+    room.lastActive = Date.now();
+    return null;
   }
 
   kick(room: Room, host: Player, id: number): { target: Player } | RoomError {
@@ -295,17 +319,21 @@ export class Rooms {
     const why = this.startProblem(room);
     if (why) return why;
     room.status = 'playing';
+    room.difficulty = difficultyOf([...room.players.values()].filter((o) => o.lostAt === null).length);
+    for (const o of room.players.values()) { o.at = 'play'; o.awayAt = null; }
     room.lastActive = Date.now();
     return null;
   }
 
-  /** La partida terminó (lo dice el anfitrión, o se perdió al anfitrión): todos vuelven al lobby. */
+  /** La partida terminó (el anfitrión ganó, perdió o salió del nivel; se perdió al anfitrión; o alguien no volvió a
+   *  tiempo): todos vuelven a la selección de nivel (etapa `browse`, todos listos) y el anfitrión elige el siguiente. */
   end(room: Room): void {
     room.status = 'lobby';
-    room.stage = 'lobby';
+    room.stage = 'browse';
     room.menu = null;
     room.votes.clear();
-    for (const o of room.players.values()) o.ready = o.id === room.hostId;
+    room.difficulty = null;
+    for (const o of room.players.values()) { o.ready = true; o.at = 'lobby'; o.awayAt = null; }
     room.lastActive = Date.now();
   }
 
@@ -322,12 +350,18 @@ export class Rooms {
       const host = room.hostId !== null ? room.players.get(room.hostId) : undefined;
       if (room.status === 'playing' && host && host.lostAt !== null && now - host.lostAt > hostGrace) {
         this.end(room);
-        events.push({ kind: 'match_aborted', room });
+        events.push({ kind: 'match_aborted', room, reason: 'host_lost' });
+      }
+      // un invitado salió del nivel y no volvió (ni a jugar ni a mirar) a tiempo: termina para todos
+      const gone = room.status === 'playing' ? [...room.players.values()].find((p) => p.awayAt !== null && now - p.awayAt > config.awayLimitSeconds * 1000) : undefined;
+      if (gone) {
+        this.end(room);
+        events.push({ kind: 'match_aborted', room, reason: 'away_timeout', name: gone.name });
       }
       for (const p of [...room.players.values()]) {
         if (p.lostAt !== null && now - p.lostAt > grace) {
           const r = this.leave(room, p);
-          events.push({ kind: 'removed', room, player: p, closed: r.closed, others: r.others });
+          events.push({ kind: 'removed', room, player: p, closed: r.closed, others: r.others, reason: r.reason });
           if (r.closed) break;
         }
       }

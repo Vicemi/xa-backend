@@ -12,7 +12,7 @@ const base = `http://127.0.0.1:${PORT}`;
 const env = {
   ...process.env, PORT: String(PORT), GAME_TOKEN: `${TOKEN},${OLD_TOKEN}`, ADMIN_TOKEN: ADMIN, ALLOWED_ORIGINS: ORIGIN, TRUST_PROXY: '0', LOG_LEVEL: 'warn',
   CREATE_ROOM_PER_MINUTE: '100', HTTP_RATE_PER_MINUTE: '1000', WS_MESSAGES_PER_SECOND: '100', MAX_CONNECTIONS_PER_IP: '100', MAX_ROOMS_PER_IP: '40',
-  RECONNECT_GRACE_SECONDS: '5', HOST_PLAY_GRACE_SECONDS: '3', JOIN_FAIL_LIMIT: '12', MAX_STRIKES: '5',
+  RECONNECT_GRACE_SECONDS: '5', HOST_PLAY_GRACE_SECONDS: '3', AWAY_LIMIT_SECONDS: '2', JOIN_FAIL_LIMIT: '12', MAX_STRIKES: '5',
 };
 const child = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts'], { env, stdio: ['ignore', 'inherit', 'inherit'] });
 
@@ -159,7 +159,15 @@ async function main() {
   check(!g1.has('rtc'), 'un invitado no puede señalarse a sí mismo');
   const late = new Client(); await late.ready();
   late.send({ t: 'join', code: created.code, name: 'Tarde' });
-  check((await late.wait('error')).code === 'started', 'nadie nuevo entra a una partida en curso');
+  const lj = await late.wait('joined');
+  check(lj.room.status === 'playing' && lj.room.players.find((p: any) => p.id === lj.you)?.at === 'lobby', 'alguien nuevo puede entrar con la partida en curso (queda en la pantalla online)');
+  late.send({ t: 'at', at: 'watch' });
+  const ls = await late.wait('start');
+  check(ls.watch === true && ls.level === 2 && ls.difficulty.players === 2, 'el que llega tarde puede mirar: recibe su propio start de espectador');
+  host.inbox.length = 0;
+  late.send({ t: 'in', d: { b: 1, q: 1 } });
+  await sleep(120);
+  check(!host.has('in'), 'los controles de un espectador no llegan al anfitrión');
 
   console.log('Sesiones');
   const sid = g1j.sid as string;
@@ -182,7 +190,70 @@ async function main() {
   const host2 = new Client(); await host2.ready();
   host2.send({ t: 'resume', code: created.code, sid: hostSid });
   const h2 = await host2.wait('joined');
-  check(h2.host === true && h2.room.status === 'lobby', 'el anfitrión vuelve (como anfitrión) al lobby');
+  check(h2.host === true && h2.room.status === 'lobby' && h2.room.stage === 'browse', 'el anfitrión vuelve (como anfitrión) a la selección de nivel');
+
+  console.log('Ciclo de partida');
+  {
+    const r = await room();
+    const h = await mk(r.code, 'Jefe', r.hostKey);
+    const a = await mk(r.code, 'Ana');
+    const b = await mk(r.code, 'Beto');
+    a.c.send({ t: 'ready', ready: true }); b.c.send({ t: 'ready', ready: true });
+    await sleep(100);
+    h.c.send({ t: 'go', on: true });
+    h.c.send({ t: 'level', level: 3 });
+    await sleep(100);
+    h.c.send({ t: 'start' });
+    await a.c.wait('start');
+    h.c.inbox.length = 0;
+    a.c.send({ t: 'at', at: 'lobby' });
+    const away = await h.c.wait('room', 2000, (m) => m.room.players.find((p: any) => p.id === a.j.you)?.at === 'lobby');
+    const ap = away.room.players.find((p: any) => p.id === a.j.you);
+    check(away.room.status === 'playing' && ap.away >= 1 && ap.away <= 2, 'un invitado sale del nivel: el anfitrión lo ve fuera (at lobby) con los segundos para volver');
+    h.c.inbox.length = 0; a.c.inbox.length = 0;
+    a.c.send({ t: 'in', d: { b: 2, q: 1 } });
+    h.c.send({ t: 'snap', d: { x: 1 } });
+    await sleep(150);
+    check(!h.c.has('in') && !a.c.has('snap'), 'fuera del nivel no manda controles ni recibe instantáneas');
+    h.c.send({ t: 'at', at: 'lobby' });
+    check((await h.c.wait('error')).code === 'forbidden', 'el anfitrión no "sale del nivel": para eso termina la partida');
+    a.c.send({ t: 'at', at: 'watch' });
+    const aw = await a.c.wait('start');
+    check(aw.watch === true && aw.you === a.j.you && aw.level === 3, 'vuelve como espectador');
+    a.c.send({ t: 'at', at: 'play' });
+    const ap2 = await a.c.wait('start', 2000, (m) => m.watch === false);
+    a.c.send({ t: 'in', d: { b: 2, q: 2 } });
+    check(!!ap2 && (await h.c.wait('in')).from === a.j.you, 'vuelve a jugar: sus controles llegan otra vez');
+    // no vuelve a tiempo: la partida termina para todos y vuelven a elegir nivel
+    a.c.send({ t: 'at', at: 'lobby' });
+    const to = await b.c.wait('ended', 7000);
+    check(to.d.reason === 'away_timeout' && to.d.name === 'Ana', 'si no vuelve a tiempo la partida termina para todos (away_timeout)');
+    const after = await h.c.wait('room', 2000, (m) => m.room.status === 'lobby');
+    check(after.room.stage === 'browse' && after.room.players.every((p: any) => p.ready && p.at === 'lobby'), 'todos quedan en la selección de nivel, listos');
+    h.c.inbox.length = 0;
+    h.c.send({ t: 'level', level: 4 });
+    h.c.send({ t: 'start' });
+    const s2 = await h.c.wait('start');
+    check(s2.level === 4 && !h.c.has('error'), 'el anfitrión elige otro nivel y arranca (sin "la partida ya empezó")');
+    h.c.send({ t: 'end', d: { quit: true } });
+    await a.c.wait('ended');
+    h.c.inbox.length = 0;
+    h.c.send({ t: 'level', level: 5 });
+    h.c.send({ t: 'start' });
+    check((await h.c.wait('start')).level === 5, 'si el anfitrión sale del nivel, termina para todos y puede elegir el siguiente');
+    b.c.send({ t: 'leave' });
+    await h.c.wait('room', 2000, (m) => m.room.players.length === 2);
+    check(!h.c.has('closed'), 'se va un invitado y quedan otros: la sala sigue');
+    a.c.send({ t: 'leave' });
+    check((await h.c.wait('closed')).reason === 'alone', 'se van todos los invitados: la sala se cierra y el anfitrión vuelve al menú');
+    check((await api('/api/rooms/' + r.code)).status === 404, 'la sala ya no existe');
+    const r2 = await room();
+    const h2b = await mk(r2.code, 'Jefe', r2.hostKey);
+    const g = await mk(r2.code, 'Gus');
+    h2b.c.send({ t: 'leave' });
+    check((await g.c.wait('closed')).reason === 'host_closed', 'el anfitrión cierra la sala: los invitados vuelven al menú (host_closed)');
+    for (const c of [h.c, a.c, b.c, h2b.c, g.c]) c.ws.terminate();
+  }
 
   console.log('Solo y límite');
   const solo = await room();

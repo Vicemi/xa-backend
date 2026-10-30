@@ -36,6 +36,8 @@ export const ClientMessage = t.Union([
   t.Object({ t: t.Literal('end'), d: t.Optional(Blob) }),
   t.Object({ t: t.Literal('ping'), n: t.Optional(t.Number()) }),
   t.Object({ t: t.Literal('leave') }),
+  // Invitado en plena partida: sale del nivel a la pantalla online, vuelve a jugar o entra a mirar.
+  t.Object({ t: t.Literal('at'), at: t.Union([t.Literal('lobby'), t.Literal('play'), t.Literal('watch')]) }),
 ]);
 export type ClientMessageT = { t: string; [k: string]: unknown };
 

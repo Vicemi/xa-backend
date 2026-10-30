@@ -108,11 +108,12 @@ export function attachWebSocket(server: HttpServer, rooms: Rooms): { close(): vo
     log.info(`room ${room.code}: ${player.name} lost the connection`);
   }
 
-  /** El jugador se fue para siempre (apretó salir, lo expulsaron o venció la gracia). */
-  function removed(room: Room, player: Player, closed: boolean, others: Player[]): void {
+  /** El jugador se fue para siempre (apretó salir, lo expulsaron o venció la gracia). `why` = motivo del cierre de la
+   *  sala para los que quedan: host_closed (el anfitrión la cerró), host_left (no volvió) o alone (se fueron todos). */
+  function removed(room: Room, player: Player, closed: boolean, others: Player[], why: string = 'host_left'): void {
     if (closed) {
-      for (const o of others) { send(o.ws, { t: 'closed', reason: 'host_left' }); o.ws?.close(1000, 'host left'); }
-      log.info(`room ${room.code} closed (host left)`);
+      for (const o of others) { send(o.ws, { t: 'closed', reason: why }); o.ws?.close(1000, why); }
+      log.info(`room ${room.code} closed (${why})`);
     } else {
       if (room.status === 'playing') send(hostOf(room)?.ws, { t: 'left', id: player.id });
       broadcastRoom(room);
@@ -186,7 +187,7 @@ export function attachWebSocket(server: HttpServer, rooms: Rooms): { close(): vo
         if (typeof r === 'string') { roomErr(c, r); break; }
         send(r.target.ws, { t: 'kicked' });
         const sock = r.target.ws;
-        const out = rooms.leave(room, r.target);
+        const out = rooms.leave(room, r.target, false);   // expulsar al último invitado no cierra la sala del anfitrión
         sock?.close(4010, 'kicked');
         removed(room, r.target, out.closed, out.others);
         log.info(`room ${room.code}: ${r.target.name} was kicked`);
@@ -196,7 +197,7 @@ export function attachWebSocket(server: HttpServer, rooms: Rooms): { close(): vo
         const e = rooms.start(room, player);
         if (e) { if (e in ERROR_TEXT) roomErr(c, e as RoomError); else err(c, 'not_ready', e); break; }
         const v = rooms.view(room);
-        const difficulty = difficultyOf(v.players.filter((p) => p.online).length);
+        const difficulty = room.difficulty ?? difficultyOf(v.players.filter((p) => p.online).length);
         for (const p of room.players.values()) send(p.ws, { t: 'start', room: v, difficulty, level: room.level, you: p.id });
         log.info(`room ${room.code}: coop of ${room.players.size} started on level ${room.level}`);
         break;
@@ -208,8 +209,18 @@ export function attachWebSocket(server: HttpServer, rooms: Rooms): { close(): vo
         send(target.ws, { t: 'rtc', from: player.id, d: m.d });
         break;
       }
+      case 'at': {   // invitado en plena partida: sale del nivel, vuelve a jugar o mira
+        const at = m.at as 'lobby' | 'play' | 'watch';
+        const e = rooms.setAt(room, player, at);
+        if (e) { roomErr(c, e); break; }
+        // al volver recibe su propio `start` (el resto sigue jugando sin enterarse más que por la sala)
+        if (at !== 'lobby') send(c.ws, { t: 'start', room: rooms.view(room), difficulty: room.difficulty ?? difficultyOf(room.players.size), level: room.level, you: player.id, watch: at === 'watch' });
+        broadcastRoom(room);
+        log.info(`room ${room.code}: ${player.name} -> ${at}`);
+        break;
+      }
       case 'in': {   // invitado -> anfitrión: el estado de sus controles
-        if (room.status !== 'playing' || isHost || room.hostId === null) break;
+        if (room.status !== 'playing' || isHost || room.hostId === null || player.at !== 'play') break;
         send(hostOf(room)?.ws, { t: 'in', from: player.id, d: m.d });
         rooms.touch(room);
         break;
@@ -217,7 +228,7 @@ export function attachWebSocket(server: HttpServer, rooms: Rooms): { close(): vo
       case 'snap': {   // anfitrión -> invitados: el mundo
         if (room.status !== 'playing' || !isHost) break;
         const out = JSON.stringify({ t: 'snap', d: m.d });
-        for (const p of room.players.values()) if (p.id !== player.id && p.ws?.readyState === WebSocket.OPEN) p.ws.send(out);
+        for (const p of room.players.values()) if (p.id !== player.id && p.at !== 'lobby' && p.ws?.readyState === WebSocket.OPEN) p.ws.send(out);
         rooms.touch(room);
         break;
       }
@@ -232,7 +243,7 @@ export function attachWebSocket(server: HttpServer, rooms: Rooms): { close(): vo
         c.room = undefined;
         c.player = undefined;
         const out = rooms.leave(room, player);
-        removed(room, player, out.closed, out.others);
+        removed(room, player, out.closed, out.others, out.reason === 'alone' ? 'alone' : 'host_closed');
         c.ws.close(1000, 'bye');
         break;
       }
@@ -252,10 +263,10 @@ export function attachWebSocket(server: HttpServer, rooms: Rooms): { close(): vo
     for (const ev of rooms.sweep()) {
       if (ev.kind === 'removed') {
         log.info(`room ${ev.room.code}: ${ev.player.name} did not come back, seat freed`);
-        removed(ev.room, ev.player, ev.closed, ev.others);
+        removed(ev.room, ev.player, ev.closed, ev.others, ev.reason === 'alone' ? 'alone' : 'host_left');
       } else if (ev.kind === 'match_aborted') {
-        log.info(`room ${ev.room.code}: match ended (host lost)`);
-        for (const p of ev.room.players.values()) send(p.ws, { t: 'ended', d: { aborted: true, reason: 'host_lost' } });
+        log.info(`room ${ev.room.code}: match ended (${ev.reason})`);
+        for (const p of ev.room.players.values()) send(p.ws, { t: 'ended', d: { aborted: true, reason: ev.reason, name: ev.name } });
         broadcastRoom(ev.room);
       } else {
         for (const p of ev.room.players.values()) { send(p.ws, { t: 'closed', reason: 'idle' }); p.ws?.close(1000, 'idle'); }
